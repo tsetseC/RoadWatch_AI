@@ -1,21 +1,24 @@
 
 # ============================================================
 # ROADWATCH AI - CES117V CAPSTONE PROJECT
-# STREAMLIT APPLICATION WITH YOLOv8n VIDEO DETECTION
+# STREAMLIT APPLICATION
+# YOLOv8n INTELLIGENT ROAD DAMAGE DETECTION
 # ============================================================
 
-# Import the required Python libraries.
-import streamlit as st
-import cv2
-import tempfile
-import subprocess
-import shutil
-import os
 import gc
-
-from pathlib import Path
+import os
+import shutil
+import subprocess
+import tempfile
 from collections import Counter
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
 from ultralytics import YOLO
+
 
 # ============================================================
 # 1. APPLICATION CONFIGURATION
@@ -27,15 +30,19 @@ st.set_page_config(
     layout="wide"
 )
 
-# Limit OpenCV CPU threading on shared hosting.
+# Reduce CPU contention on shared hosting.
 cv2.setNumThreads(1)
 
-# Locate the trained YOLOv8n model.
+# Project directory and trained model.
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "best.pt"
 
-# Define the five supported damage categories.
-CLASS_NAMES = [
+# Maximum permitted upload size.
+MAX_UPLOAD_MB = 50
+
+# The five classes from the training configuration.
+# Actual prediction labels are read from best.pt.
+EXPECTED_CLASSES = [
     "Longitudinal Crack",
     "Transverse Crack",
     "Alligator Crack",
@@ -43,24 +50,122 @@ CLASS_NAMES = [
     "Pothole"
 ]
 
+
 # ============================================================
-# 2. LOAD THE TRAINED MODEL
+# 2. PAGE STYLING
 # ============================================================
 
-# Cache the model to avoid loading it repeatedly
-# during Streamlit interface updates.
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #0b1424;
+        color: #f1f5f9;
+    }
+
+    h1, h2, h3 {
+        color: #f1f5f9;
+    }
+
+    div[data-testid="stMetric"] {
+        background-color: #17243b;
+        padding: 16px;
+        border-radius: 12px;
+        border: 1px solid #30415d;
+    }
+
+    div.stButton > button[kind="primary"] {
+        background-color: #0284c7;
+        border-radius: 9px;
+        color: white;
+        font-weight: 600;
+    }
+
+    div.stDownloadButton > button {
+        border-radius: 9px;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# 3. LOAD THE TRAINED YOLO MODEL
+# ============================================================
+
 @st.cache_resource
 def load_model():
+    """
+    Load the YOLOv8n model only once per app process.
+
+    The weights contain the learned road-damage features
+    and the original training class names.
+    """
+
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
-            "Trained model best.pt was not found."
+            f"Cannot find trained model: {MODEL_PATH}"
         )
 
     return YOLO(str(MODEL_PATH))
 
 
+def get_class_name(model, class_id):
+    """
+    Obtain a class name from the trained model metadata.
+
+    Avoid assuming that a manually written class list
+    always matches the model's internal class IDs.
+    """
+
+    names = model.names
+
+    if isinstance(names, dict):
+        return str(
+            names.get(class_id, f"Class {class_id}")
+        )
+
+    if 0 <= class_id < len(names):
+        return str(names[class_id])
+
+    return f"Class {class_id}"
+
+
 # ============================================================
-# 3. VIDEO DETECTION FUNCTION
+# 4. RESIZE VIDEO FRAMES
+# ============================================================
+
+def resize_frame(frame, max_width=960):
+    """
+    Resize large frames while preserving aspect ratio.
+
+    Smaller frames remain at their original resolution.
+    """
+
+    height, width = frame.shape[:2]
+
+    if width <= max_width:
+        return frame
+
+    scale = max_width / width
+
+    new_width = int(width * scale)
+    new_height = max(
+        1,
+        int(round(height * scale))
+    )
+
+    return cv2.resize(
+        frame,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+# ============================================================
+# 5. PROCESS THE VIDEO
 # ============================================================
 
 def process_video(
@@ -70,59 +175,110 @@ def process_video(
     image_size,
     frame_interval,
     max_frames,
+    playback_speed,
     progress_bar,
     status_text
 ):
     """
-    Analyze sampled frames using YOLOv8n.
+    Perform YOLO road-damage detection on selected frames.
 
-    The output contains annotated sampled frames.
-    Sampling reduces computation on shared CPU hosting.
+    FRAME INTERVAL:
+        1 = Analyze every frame.
+        5 = Analyze every fifth frame.
+
+    MAX FRAMES:
+        Maximum number of YOLO inference operations.
+
+    PLAYBACK SPEED:
+        1.0 = Normal speed.
+        0.5 = Half speed.
+        0.25 = Quarter speed.
+
+    The exported video contains only analyzed frames.
+
+    The output frame rate is adjusted to approximate
+    the source-video timing after frame sampling.
     """
 
-    # Load the model using Streamlit's cache.
     model = load_model()
 
-    # Open the uploaded video.
     capture = cv2.VideoCapture(str(input_path))
 
     if not capture.isOpened():
-        raise ValueError("Unable to open the video file.")
+        raise ValueError(
+            "Unable to open the uploaded video."
+        )
 
     writer = None
+
+    # Track original frames read and analyzed.
     frames_read = 0
     frames_analyzed = 0
 
-    # Store the number of detected objects per class.
+    # Track prediction counts for each category.
     detection_counts = Counter()
 
+    # Collect confidence information for reporting.
+    detection_records = []
+
     try:
-        # Read the video properties.
-        source_fps = capture.get(cv2.CAP_PROP_FPS)
+
+        # ----------------------------------------------------
+        # READ VIDEO PROPERTIES
+        # ----------------------------------------------------
+
+        source_fps = float(
+            capture.get(cv2.CAP_PROP_FPS)
+        )
+
         total_frames = int(
             capture.get(cv2.CAP_PROP_FRAME_COUNT)
         )
 
-        if source_fps <= 0 or source_fps > 120:
+        if (
+            not np.isfinite(source_fps)
+            or source_fps <= 0
+            or source_fps > 120
+        ):
             source_fps = 25.0
 
-        # Adjust output FPS to match frame sampling.
+        # ----------------------------------------------------
+        # CALCULATE OUTPUT FRAME RATE
+        # ----------------------------------------------------
+
+        # Example:
+        # Original FPS = 30
+        # Frame interval = 1
+        # Playback speed = 0.5
+        #
+        # Output FPS = 15
+        #
+        # 120 output frames / 15 FPS = 8 seconds.
+
         output_fps = max(
             1.0,
-            source_fps / frame_interval
+            (
+                source_fps / frame_interval
+            ) * playback_speed
         )
 
-        # Estimate the number of frames to analyze.
+        # Calculate the number of frames expected.
         expected_frames = max_frames
 
         if total_frames > 0:
+            available_samples = (
+                total_frames + frame_interval - 1
+            ) // frame_interval
+
             expected_frames = min(
                 max_frames,
-                (total_frames + frame_interval - 1)
-                // frame_interval
+                available_samples
             )
 
-        # Read frames until the limit is reached.
+        # ----------------------------------------------------
+        # VIDEO PROCESSING LOOP
+        # ----------------------------------------------------
+
         while frames_analyzed < max_frames:
 
             success, frame = capture.read()
@@ -130,30 +286,25 @@ def process_video(
             if not success:
                 break
 
-            current_frame = frames_read
+            original_frame_index = frames_read
             frames_read += 1
 
-            # Only analyze selected video frames.
-            if current_frame % frame_interval != 0:
+            # Skip frames not selected for inference.
+            if (
+                original_frame_index % frame_interval
+                != 0
+            ):
                 continue
 
-            # Resize the frame to reduce memory usage.
-            height, width = frame.shape[:2]
-
-            if width > 640:
-                scale = 640 / width
-
-                frame = cv2.resize(
-                    frame,
-                    (
-                        640,
-                        max(1, int(height * scale))
-                    )
-                )
+            # Reduce large frame dimensions.
+            frame = resize_frame(frame)
 
             height, width = frame.shape[:2]
 
-            # Create the video writer once.
+            # ------------------------------------------------
+            # INITIALIZE VIDEO WRITER
+            # ------------------------------------------------
+
             if writer is None:
 
                 fourcc = cv2.VideoWriter_fourcc(
@@ -169,17 +320,17 @@ def process_video(
 
                 if not writer.isOpened():
                     raise RuntimeError(
-                        "Could not create output video."
+                        "Unable to create output MP4."
                     )
 
-            # ============================================
-            # PERFORM ROAD-DAMAGE OBJECT DETECTION
-            # ============================================
+            # ------------------------------------------------
+            # PERFORM YOLOv8n INFERENCE
+            # ------------------------------------------------
 
             results = model.predict(
                 source=frame,
-                conf=confidence,
                 imgsz=image_size,
+                conf=confidence,
                 device="cpu",
                 max_det=50,
                 verbose=False
@@ -187,49 +338,81 @@ def process_video(
 
             result = results[0]
 
-            # Count detections by their class ID.
+            # ------------------------------------------------
+            # RECORD DETECTED DAMAGE
+            # ------------------------------------------------
+
             for box in result.boxes:
 
                 class_id = int(box.cls.item())
+                score = float(box.conf.item())
 
-                class_name = (
-                    CLASS_NAMES[class_id]
-                    if 0 <= class_id < len(CLASS_NAMES)
-                    else f"Class {class_id}"
+                class_name = get_class_name(
+                    model,
+                    class_id
                 )
 
                 detection_counts[class_name] += 1
 
-            # Draw bounding boxes on the frame.
+                detection_records.append({
+                    "Frame": original_frame_index,
+                    "Damage Type": class_name,
+                    "Confidence": round(score, 3)
+                })
+
+            # ------------------------------------------------
+            # DRAW BOUNDING BOXES
+            # ------------------------------------------------
+
             annotated_frame = result.plot()
 
-            # Write the result to the video.
+            # Ensure that output dimensions remain fixed.
+            if (
+                annotated_frame.shape[1] != width
+                or annotated_frame.shape[0] != height
+            ):
+
+                annotated_frame = cv2.resize(
+                    annotated_frame,
+                    (width, height)
+                )
+
+            # Write annotated frame into output video.
             writer.write(annotated_frame)
 
             frames_analyzed += 1
 
-            # Update the Streamlit progress indicator.
+            # ------------------------------------------------
+            # UPDATE THE STREAMLIT PROGRESS BAR
+            # ------------------------------------------------
+
             progress_bar.progress(
                 min(
-                    frames_analyzed / max(
-                        expected_frames, 1
-                    ),
-                    1.0
+                    1.0,
+                    frames_analyzed /
+                    max(expected_frames, 1)
                 )
             )
 
             status_text.text(
-                f"Analyzing frame {frames_analyzed} "
+                f"Analyzing frame "
+                f"{frames_analyzed} "
                 f"of {expected_frames}"
             )
 
+            # Release intermediate results.
+            del results
+            del result
+            del annotated_frame
+
         if frames_analyzed == 0:
             raise ValueError(
-                "No readable video frames found."
+                "No readable frames were found."
             )
 
     finally:
-        # Always close video-processing resources.
+
+        # Always close video resources.
         capture.release()
 
         if writer is not None:
@@ -237,18 +420,82 @@ def process_video(
 
         gc.collect()
 
+    # --------------------------------------------------------
+    # CALCULATE OUTPUT VIDEO DURATION
+    # --------------------------------------------------------
+
+    output_duration = (
+        frames_analyzed / output_fps
+    )
+
     return {
+        "source_fps": source_fps,
+        "source_total_frames": total_frames,
         "frames_read": frames_read,
         "frames_analyzed": frames_analyzed,
-        "detections": dict(detection_counts),
+        "output_fps": output_fps,
+        "output_duration": output_duration,
         "total_detections": sum(
             detection_counts.values()
-        )
+        ),
+        "detections": dict(detection_counts),
+        "records": detection_records
     }
 
 
 # ============================================================
-# 4. USER INTERFACE
+# 6. CONVERT OUTPUT TO BROWSER-COMPATIBLE MP4
+# ============================================================
+
+def convert_to_h264(source_path, target_path):
+    """
+    Convert the generated video to H.264.
+
+    This improves playback in browsers.
+
+    Requires ffmpeg to be installed on the server.
+    """
+
+    if shutil.which("ffmpeg") is None:
+        return False
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-i", str(source_path),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "25",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        str(target_path)
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+
+        return (
+            completed.returncode == 0
+            and target_path.is_file()
+            and target_path.stat().st_size > 0
+        )
+
+    except (
+        subprocess.TimeoutExpired,
+        OSError
+    ):
+        return False
+
+
+# ============================================================
+# 7. APPLICATION HEADER
 # ============================================================
 
 st.title("🛣️ RoadWatch AI")
@@ -257,15 +504,16 @@ st.header("Intelligent Road Damage Detection")
 
 st.write(
     "Upload road inspection footage to detect "
-    "longitudinal cracks, transverse cracks, "
-    "alligator cracks, other corruption and potholes "
-    "using a custom-trained YOLOv8n model."
+    "potholes, longitudinal cracks, transverse cracks, "
+    "alligator cracks and other road damage using a "
+    "custom-trained YOLOv8n model."
 )
 
 st.divider()
 
+
 # ============================================================
-# 5. VIDEO UPLOAD
+# 8. VIDEO UPLOAD INTERFACE
 # ============================================================
 
 st.subheader("Upload Road Inspection Video")
@@ -275,214 +523,449 @@ uploaded_video = st.file_uploader(
     type=["mp4", "avi", "mov", "mkv"]
 )
 
-# Allow users to adjust model parameters.
-with st.expander("Detection Settings"):
+# ------------------------------------------------------------
+# DETECTION SETTINGS
+# ------------------------------------------------------------
 
+with st.expander(
+    "Detection Settings",
+    expanded=True
+):
+
+    # Lowest available confidence is intended for
+    # diagnostic testing of weaker predictions.
     confidence = st.slider(
         "Confidence Threshold",
-        min_value=0.10,
+        min_value=0.05,
         max_value=0.90,
-        value=0.25,
+        value=0.10,
         step=0.05
     )
 
+    # Allow users to control inference image size.
     image_size = st.select_slider(
         "Inference Resolution",
-        options=[256, 320, 416, 512, 640],
-        value=320
+        options=[
+            256, 320, 416, 512, 640
+        ],
+        value=640
     )
 
+    # Select which source frames undergo detection.
     frame_interval = st.selectbox(
         "Analyze every Nth frame",
         options=[1, 2, 5, 10],
-        index=2
+        index=0
     )
 
+    # Choose the number of frames to analyze.
     max_frames = st.number_input(
         "Maximum frames to analyze",
         min_value=1,
-        max_value=300,
-        value=10,
-        step=1
+        max_value=1000,
+        value=120,
+        step=10
     )
 
+    # --------------------------------------------------------
+    # NEW: VIDEO PLAYBACK SPEED
+    # --------------------------------------------------------
+
+    playback_speed = st.selectbox(
+        "Annotated Video Playback Speed",
+        options=[0.25, 0.5, 0.75, 1.0],
+        index=1,
+        format_func=lambda speed: (
+            f"{speed}x Speed"
+        )
+    )
+
+    st.caption(
+        "Slower playback increases output duration. "
+        "More analyzed frames increase processing time. "
+        "Sampling skips inference on intermediate frames."
+    )
+
+
 # ============================================================
-# 6. RUN VIDEO ANALYSIS
+# 9. UPLOAD PREVIEW AND ANALYSIS
 # ============================================================
 
 if uploaded_video is not None:
 
-    # Preview the uploaded video.
-    st.success("Video uploaded successfully.")
+    # Clear old analysis if a different video is uploaded.
+    upload_signature = (
+        uploaded_video.name,
+        uploaded_video.size
+    )
+
+    if (
+        st.session_state.get("upload_signature")
+        != upload_signature
+    ):
+        st.session_state["upload_signature"] = (
+            upload_signature
+        )
+
+        st.session_state.pop(
+            "roadwatch_result",
+            None
+        )
+
+    st.success(
+        "Video uploaded successfully."
+    )
+
+    st.subheader("Original Road Inspection Video")
 
     st.video(uploaded_video)
 
-    # Begin detection when the button is clicked.
+    # Display the source file size.
+    st.caption(
+        f"Uploaded file size: "
+        f"{uploaded_video.size / (1024 * 1024):.2f} MB"
+    )
+
+    # --------------------------------------------------------
+    # START INFERENCE
+    # --------------------------------------------------------
+
     if st.button(
         "Analyze Road Video",
         type="primary"
     ):
 
-        # Reject unusually large files on free hosting.
-        if uploaded_video.size > 50 * 1024 * 1024:
+        if (
+            uploaded_video.size >
+            MAX_UPLOAD_MB * 1024 * 1024
+        ):
             st.error(
-                "Please upload a video smaller than 50 MB."
+                f"Maximum upload size is "
+                f"{MAX_UPLOAD_MB} MB."
             )
 
         else:
+
+            # Remove any previous detection result.
+            st.session_state.pop(
+                "roadwatch_result",
+                None
+            )
+
             progress_bar = st.progress(0)
             status_text = st.empty()
 
             try:
+
                 with st.spinner(
-                    "Running YOLOv8n road-damage detection..."
+                    "Running RoadWatch AI detection..."
                 ):
 
-                    # Use a temporary directory for uploaded
-                    # and generated video files.
+                    # Create temporary processing files.
                     with tempfile.TemporaryDirectory() as tmp:
 
-                        input_path = Path(tmp) / (
-                            "input" +
-                            Path(uploaded_video.name).suffix.lower()
+                        temp_dir = Path(tmp)
+
+                        extension = Path(
+                            uploaded_video.name
+                        ).suffix.lower()
+
+                        input_path = (
+                            temp_dir /
+                            f"input{extension}"
                         )
 
-                        output_path = Path(tmp) / "result.mp4"
+                        output_path = (
+                            temp_dir /
+                            "roadwatch_output.mp4"
+                        )
 
-                        # Save the uploaded video temporarily.
+                        h264_path = (
+                            temp_dir /
+                            "roadwatch_h264.mp4"
+                        )
+
+                        # Save original uploaded video.
                         input_path.write_bytes(
                             uploaded_video.getvalue()
                         )
 
-                        # Run YOLOv8n detection.
+                        # ------------------------------------
+                        # RUN ROAD-DAMAGE DETECTION
+                        # ------------------------------------
+
                         stats = process_video(
-                            input_path,
-                            output_path,
-                            confidence,
-                            image_size,
-                            frame_interval,
-                            max_frames,
-                            progress_bar,
-                            status_text
+                            input_path=input_path,
+                            output_path=output_path,
+                            confidence=confidence,
+                            image_size=image_size,
+                            frame_interval=frame_interval,
+                            max_frames=int(max_frames),
+                            playback_speed=playback_speed,
+                            progress_bar=progress_bar,
+                            status_text=status_text
                         )
 
-                        # Read the generated MP4.
-                        # Optionally transcode it to H.264
-                        # for improved browser compatibility.
-                        playable_path = output_path
-                        h264_path = Path(tmp) / "result_h264.mp4"
-
-                        if shutil.which("ffmpeg"):
-                            conversion = subprocess.run(
-                                [
-                                    "ffmpeg", "-y",
-                                    "-loglevel", "error",
-                                    "-i", str(output_path),
-                                    "-c:v", "libx264",
-                                    "-preset", "ultrafast",
-                                    "-pix_fmt", "yuv420p",
-                                    "-movflags", "+faststart",
-                                    str(h264_path)
-                                ],
-                                capture_output=True,
-                                text=True
+                        # Check that MP4 was created.
+                        if (
+                            not output_path.is_file()
+                            or output_path.stat().st_size == 0
+                        ):
+                            raise RuntimeError(
+                                "Output video is missing."
                             )
 
-                            if (
-                                conversion.returncode == 0
-                                and h264_path.is_file()
-                                and h264_path.stat().st_size > 0
-                            ):
-                                playable_path = h264_path
+                        # ------------------------------------
+                        # CONVERT OUTPUT TO H.264
+                        # ------------------------------------
 
-                        output_bytes = playable_path.read_bytes()
+                        status_text.text(
+                            "Preparing annotated video..."
+                        )
 
-                    # Save results in the Streamlit session.
-                    st.session_state["roadwatch_result"] = {
+                        converted = convert_to_h264(
+                            output_path,
+                            h264_path
+                        )
+
+                        playable_path = (
+                            h264_path
+                            if converted
+                            else output_path
+                        )
+
+                        # Keep file data after temp cleanup.
+                        output_bytes = (
+                            playable_path.read_bytes()
+                        )
+
+                    # ----------------------------------------
+                    # STORE RESULTS IN STREAMLIT SESSION
+                    # ----------------------------------------
+
+                    st.session_state[
+                        "roadwatch_result"
+                    ] = {
                         "stats": stats,
                         "video": output_bytes,
-                        "browser_compatible": (
-                            playable_path == h264_path
-                        )
+                        "browser_compatible": converted,
+                        "source": upload_signature,
+                        "settings": {
+                            "confidence": confidence,
+                            "image_size": image_size,
+                            "frame_interval": frame_interval,
+                            "max_frames": int(max_frames),
+                            "playback_speed": playback_speed
+                        }
                     }
 
+                    status_text.text(
+                        "Video processing completed."
+                    )
+
+                    progress_bar.progress(1.0)
+
+                    st.success(
+                        "Road damage analysis completed!"
+                    )
+
             except Exception as error:
+
                 st.error(
-                    "Unable to complete video processing."
+                    "Video processing failed."
                 )
+
+                # Show traceback during capstone testing.
                 st.exception(error)
 
+
 # ============================================================
-# 7. DISPLAY DETECTION RESULTS
+# 10. DETECTION RESULTS
 # ============================================================
 
 if "roadwatch_result" in st.session_state:
 
-    saved_result = st.session_state["roadwatch_result"]
+    saved_result = st.session_state[
+        "roadwatch_result"
+    ]
 
-    stats = saved_result["stats"]
+    # Display only for the matching uploaded video.
+    if (
+        uploaded_video is not None
+        and saved_result["source"] ==
+        (
+            uploaded_video.name,
+            uploaded_video.size
+        )
+    ):
 
-    st.divider()
+        stats = saved_result["stats"]
 
-    st.subheader("Detection Results")
+        st.divider()
 
-    # Display summary metrics.
-    col1, col2, col3 = st.columns(3)
+        st.header("Detection Results")
 
-    col1.metric(
-        "Source Frames Read",
-        stats["frames_read"]
-    )
+        # ----------------------------------------------------
+        # RESULTS DASHBOARD
+        # ----------------------------------------------------
 
-    col2.metric(
-        "Frames Analyzed",
-        stats["frames_analyzed"]
-    )
+        col1, col2, col3 = st.columns(3)
 
-    col3.metric(
-        "Total Detections",
-        stats["total_detections"]
-    )
-
-    # Display detected road-damage categories.
-    st.subheader("Detected Damage Categories")
-
-    if stats["detections"]:
-
-        st.bar_chart(stats["detections"])
-
-    else:
-        st.info(
-            "No road damage exceeded the selected "
-            "confidence threshold in sampled frames."
+        col1.metric(
+            "Source Frames Read",
+            stats["frames_read"]
         )
 
-    # Display the annotated output.
-    st.subheader("Annotated Video")
-
-    if saved_result["browser_compatible"]:
-        st.video(saved_result["video"])
-    else:
-        st.warning(
-            "Browser playback may be unavailable. "
-            "Download the MP4 to view it locally."
+        col2.metric(
+            "Frames Analyzed",
+            stats["frames_analyzed"]
         )
 
-    # Allow the user to download the output video.
-    st.download_button(
-        label="Download Annotated Video",
-        data=saved_result["video"],
-        file_name="RoadWatch_AI_Result.mp4",
-        mime="video/mp4"
-    )
+        col3.metric(
+            "Total Detections",
+            stats["total_detections"]
+        )
 
-    st.caption(
-        "Detection counts represent predictions "
-        "across analyzed frames, not unique road defects."
-    )
+        st.divider()
+
+        # ----------------------------------------------------
+        # VIDEO SUMMARY
+        # ----------------------------------------------------
+
+        st.subheader("Video Processing Summary")
+
+        left, right = st.columns(2)
+
+        left.metric(
+            "Output Video Duration",
+            f"{stats['output_duration']:.2f} sec"
+        )
+
+        right.metric(
+            "Output Frame Rate",
+            f"{stats['output_fps']:.2f} FPS"
+        )
+
+        st.caption(
+            "Output duration depends on the number "
+            "of analyzed frames, frame sampling, "
+            "and selected playback speed."
+        )
+
+        # ----------------------------------------------------
+        # DETECTED DAMAGE CATEGORIES
+        # ----------------------------------------------------
+
+        st.subheader("Detected Damage Categories")
+
+        if stats["detections"]:
+
+            chart_data = pd.DataFrame(
+                [
+                    {
+                        "Damage Type": name,
+                        "Detections": count
+                    }
+                    for name, count
+                    in stats["detections"].items()
+                ]
+            )
+
+            chart_data = chart_data.set_index(
+                "Damage Type"
+            )
+
+            st.bar_chart(
+                chart_data,
+                y="Detections"
+            )
+
+        else:
+
+            st.info(
+                "No road damage exceeded the selected "
+                "confidence threshold in analyzed frames."
+            )
+
+        # ----------------------------------------------------
+        # DETAILED DETECTION RECORDS
+        # ----------------------------------------------------
+
+        if stats["records"]:
+
+            st.subheader("Detection Details")
+
+            details = pd.DataFrame(
+                stats["records"]
+            )
+
+            st.dataframe(
+                details,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Download structured detection information.
+            csv_data = details.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                label="Download Detection Report (CSV)",
+                data=csv_data,
+                file_name="RoadWatch_AI_Detections.csv",
+                mime="text/csv"
+            )
+
+        # ----------------------------------------------------
+        # DISPLAY ANNOTATED VIDEO
+        # ----------------------------------------------------
+
+        st.divider()
+
+        st.subheader("Annotated Road Inspection Video")
+
+        if saved_result["browser_compatible"]:
+
+            st.video(
+                saved_result["video"],
+                format="video/mp4"
+            )
+
+        else:
+
+            st.warning(
+                "Browser playback may not be available. "
+                "Download the MP4 to view it locally."
+            )
+
+        # ----------------------------------------------------
+        # DOWNLOAD ANNOTATED VIDEO
+        # ----------------------------------------------------
+
+        st.download_button(
+            label="Download Annotated Video",
+            data=saved_result["video"],
+            file_name="RoadWatch_AI_Result.mp4",
+            mime="video/mp4",
+            type="primary"
+        )
+
+        st.caption(
+            "Detection counts represent predictions "
+            "across analyzed frames, not necessarily "
+            "unique potholes or cracks."
+        )
+
+        st.caption(
+            "Only selected frames are exported. "
+            "The video may not cover the entire "
+            "duration of the original footage."
+        )
+
 
 # ============================================================
-# 8. FOOTER
+# 11. FOOTER
 # ============================================================
 
 st.divider()
