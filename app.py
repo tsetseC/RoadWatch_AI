@@ -122,10 +122,12 @@ def process_video(input_path, output_path):
             # A lower confidence threshold helps investigate
             # weak detections that the model may otherwise reject.
             results = model.predict(
-                source=frame,
-                conf=0.10,
-                imgsz=512,
-                verbose=False
+                 source=frame,
+                 imgsz=320,
+                 conf=0.25,
+                 device="cpu",
+                 max_det=30,
+                 verbose=False
             )
 
             # Count the detections in the current frame.
