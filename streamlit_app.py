@@ -179,6 +179,43 @@ st.write("Upload road inspection footage to detect potholes, longitudinal cracks
          "custom-trained YOLOv8n model.")
 st.divider()
 
+# ============================================================
+# IN-APP USER GUIDE: HOW TO TEST ALL FIVE DAMAGE CLASSES
+# ============================================================
+
+with st.expander("📘 How to use and test RoadWatch AI", expanded=True):
+    st.markdown("""
+    **Quick testing procedure**
+
+    1. Choose an **MP4, AVI, MOV or MKV** road-inspection video (under 50 MB).
+       Prefer footage where the road surface fills most of the frame.
+    2. Select **Confidence = 0.10**, **Resolution = 640**, and
+       **Analyze every Nth frame = 1** for an initial diagnostic test.
+    3. Start with **20 frames**. If successful, increase to **120** or more
+       for a longer portion of the video.
+    4. Choose **Playback Speed = 0.10×** for a slow-motion annotated output.
+       This slows the video but does not generate new frames.
+    5. Click **Analyze Road Video** and review the detected classes,
+       confidence table and annotated output.
+    6. Download the **MP4** and **CSV** for project evidence.
+
+    **To check all five classes:** test multiple videos, each clearly showing
+    a different type of road damage. Use footage from the held-out RDD 2022
+    test set where possible, with known ground-truth annotations.
+    """)
+    st.table(pd.DataFrame([
+        {"Class": "Longitudinal Crack", "What to look for": "Crack parallel to traffic direction"},
+        {"Class": "Transverse Crack", "What to look for": "Crack across the direction of travel"},
+        {"Class": "Alligator Crack", "What to look for": "Interconnected, mesh-like cracking"},
+        {"Class": "Other Corruption", "What to look for": "Other labeled pavement damage in the training set"},
+        {"Class": "Pothole", "What to look for": "Localized hole or missing road surface"},
+    ]))
+    st.info(
+        "A zero count for a class does not prove the model cannot detect it. "
+        "A positive prediction also needs visual verification: inspect the box "
+        "against the actual road defect and its labeled ground truth."
+    )
+
 st.subheader("Upload Road Inspection Video")
 upload = st.file_uploader("Choose an inspection video", type=["mp4", "avi", "mov", "mkv"])
 
@@ -189,10 +226,11 @@ with st.expander("Detection Settings", expanded=True):
     max_frames = st.number_input("Maximum frames to analyze", min_value=1,
                                  max_value=1000, value=20, step=10)
     playback_speed = st.selectbox("Annotated Video Playback Speed",
-                                  options=[0.25, 0.5, 0.75, 1.0], index=1,
+                                  options=[0.10, 0.25, 0.5, 0.75, 1.0], index=0,
                                   format_func=lambda speed: f"{speed}× Speed")
-    st.caption("At 0.5×, 20 analyzed frames from a 30 FPS source produce a "
-               "1.33-second video. Increase frames for a longer output.")
+    st.caption("0.10× plays the annotated results very slowly. "
+               "Longer source coverage requires more analyzed frames; "
+               "slower playback alone does not reveal additional footage.")
 
 if upload is not None:
     signature = (upload.name, upload.size, upload.getvalue()[:128])
@@ -265,6 +303,14 @@ if saved is not None and upload is not None and saved["source"] == signature:
     st.caption("Duration depends on number of analyzed frames, sampling interval and playback speed.")
 
     st.subheader("Detected Damage Categories")
+    st.caption("Counts are predictions across frames, not unique physical defects.")
+    # Always display all trained classes, including zero-count classes.
+    trained_names = [class_name(load_model(), i) for i in range(len(load_model().names))]
+    summary = pd.DataFrame([
+        {"Class": name, "Detections": stats["detections"].get(name, 0)}
+        for name in trained_names
+    ])
+    st.dataframe(summary, use_container_width=True, hide_index=True)
     if stats["detections"]:
         categories = pd.DataFrame(
             [{"Damage Type": k, "Detections": v} for k, v in stats["detections"].items()]
@@ -288,8 +334,9 @@ if saved is not None and upload is not None and saved["source"] == signature:
         st.warning("Browser playback may be unavailable without FFmpeg/H.264. Download the MP4 to view locally.")
     st.download_button("Download Annotated Video", saved["video"],
                        file_name="RoadWatch_AI_Result.mp4", mime="video/mp4", type="primary")
-    st.caption("Counts represent detections across analyzed frames, not unique road defects. "
-               "Exported video includes only analyzed frames, not the complete source timeline.")
+    st.caption("Counts represent predictions across analyzed frames, not unique road defects. "
+               "The export contains only sampled frames; slowing playback does not restore "
+               "unprocessed frames. Very slow playback can look choppy.")
 
 st.divider()
 st.caption("RoadWatch AI | CES117V Capstone Project | YOLOv8n | RDD 2022")
