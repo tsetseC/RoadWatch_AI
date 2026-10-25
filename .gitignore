@@ -1,0 +1,24 @@
+
+# RoadWatch AI - GitHub exclusions
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Temporary uploaded and processed videos
+uploads/
+outputs/
+
+# Editor settings
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local environment variables
+.env

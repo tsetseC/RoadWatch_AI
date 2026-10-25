@@ -1,0 +1,304 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <!-- Make the interface responsive on mobile devices -->
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <title>RoadWatch AI | Road Damage Detection</title>
+
+    <style>
+        /* ========================================
+           ROADWATCH AI - USER INTERFACE STYLING
+           ======================================== */
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #0b1220;
+            color: #ffffff;
+        }
+
+        /* Application navigation header */
+        header {
+            background: #111d30;
+            padding: 22px 7%;
+            border-bottom: 1px solid #26364d;
+        }
+
+        .brand {
+            color: #38bdf8;
+            font-size: 25px;
+            font-weight: bold;
+        }
+
+        /* Main application content */
+        main {
+            max-width: 900px;
+            margin: 55px auto;
+            padding: 0 20px;
+        }
+
+        h1 {
+            font-size: 34px;
+            margin-bottom: 12px;
+        }
+
+        .subtitle {
+            color: #aebed0;
+            line-height: 1.7;
+        }
+
+        /* Video-upload panel */
+        .upload-card {
+            margin-top: 30px;
+            background: #152238;
+            border: 1px solid #30415c;
+            padding: 30px;
+            border-radius: 16px;
+        }
+
+        input[type="file"] {
+            width: 100%;
+            padding: 15px;
+            background: #0b1220;
+            border-radius: 8px;
+            color: white;
+            margin: 15px 0;
+        }
+
+        button, .download-btn {
+            display: inline-block;
+            padding: 14px 25px;
+            border: none;
+            border-radius: 8px;
+            background: #0284c7;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        button:hover, .download-btn:hover {
+            background: #0369a1;
+        }
+
+        button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        /* Processing and error messages */
+        #status {
+            margin-top: 20px;
+            line-height: 1.6;
+        }
+
+        .error {
+            color: #fca5a5;
+        }
+
+        .success {
+            color: #86efac;
+        }
+
+        /* Detection result panel */
+        #result {
+            display: none;
+            margin-top: 30px;
+            padding: 25px;
+            background: #152238;
+            border-radius: 16px;
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #94a3b8;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- ========================================
+         APPLICATION HEADER
+         ======================================== -->
+    <header>
+        <div class="brand">RoadWatch AI</div>
+    </header>
+
+    <main>
+        <h1>Intelligent Road Damage Detection</h1>
+
+        <p class="subtitle">
+            Upload a road inspection video to identify
+            potholes, longitudinal cracks, transverse cracks,
+            alligator cracks and other road damage using
+            our fine-tuned YOLOv8n model.
+        </p>
+
+        <!-- ========================================
+             VIDEO UPLOAD FORM
+             ======================================== -->
+        <section class="upload-card">
+
+            <h2>Upload Road Inspection Video</h2>
+
+            <p class="subtitle">
+                Supported formats: MP4, AVI, MOV and MKV.
+                Maximum upload size: 100 MB.
+            </p>
+
+            <form id="uploadForm">
+
+                <!-- The name must match Flask's request.files["video"] -->
+                <input
+                    type="file"
+                    id="video"
+                    name="video"
+                    accept=".mp4,.avi,.mov,.mkv"
+                    required
+                >
+
+                <button type="submit" id="submitBtn">
+                    Analyze Road Video
+                </button>
+
+            </form>
+
+            <!-- Display processing status and errors -->
+            <div id="status" role="status" aria-live="polite"></div>
+
+        </section>
+
+        <!-- ========================================
+             DETECTION RESULTS
+             ======================================== -->
+        <section id="result">
+
+            <h2>Detection Completed</h2>
+
+            <p id="frameCount"></p>
+
+            <!-- Download annotated video from Flask -->
+            <a
+                id="downloadLink"
+                class="download-btn"
+                href="#"
+            >
+                Download Annotated Video
+            </a>
+
+        </section>
+
+    </main>
+
+    <footer>
+        RoadWatch AI | CES117V Capstone Project |
+        Powered by YOLOv8n
+    </footer>
+
+    <script>
+        // ==========================================
+        // ROADWATCH AI - FRONTEND LOGIC
+        // ==========================================
+
+        // Obtain the form and interface elements.
+        const form = document.getElementById("uploadForm");
+        const button = document.getElementById("submitBtn");
+        const status = document.getElementById("status");
+        const result = document.getElementById("result");
+        const frameCount = document.getElementById("frameCount");
+        const downloadLink = document.getElementById("downloadLink");
+
+        // Handle the video-upload form submission.
+        form.addEventListener("submit", async function(event) {
+
+            // Prevent the page from refreshing.
+            event.preventDefault();
+
+            // Retrieve the selected video file.
+            const videoFile =
+                document.getElementById("video").files[0];
+
+            // Verify that a video has been selected.
+            if (!videoFile) {
+                status.textContent = "Please select a video.";
+                status.className = "error";
+                return;
+            }
+
+            // Verify the maximum upload size (100 MB).
+            if (videoFile.size > 100 * 1024 * 1024) {
+                status.textContent =
+                    "The selected video exceeds 100 MB.";
+                status.className = "error";
+                return;
+            }
+
+            // Prepare the file for submission to Flask.
+            const formData = new FormData();
+            formData.append("video", videoFile);
+
+            // Update the interface during processing.
+            button.disabled = true;
+            status.textContent =
+                "Processing video. Please keep this page open.";
+            status.className = "";
+            result.style.display = "none";
+
+            try {
+                // Submit the video to Flask's /predict endpoint.
+                const response = await fetch("/predict", {
+                    method: "POST",
+                    body: formData
+                });
+
+                // Read the JSON response from Flask.
+                const data = await response.json();
+
+                // Handle backend processing errors.
+                if (!response.ok) {
+                    throw new Error(
+                        data.error || "Video processing failed."
+                    );
+                }
+
+                // Show successful processing information.
+                status.textContent = data.message;
+                status.className = "success";
+
+                // Display the number of processed frames.
+                frameCount.textContent =
+                    "Frames processed: " + data.frames_processed;
+
+                // Set the URL for downloading the output.
+                downloadLink.href = data.download_url;
+
+                // Display the result panel.
+                result.style.display = "block";
+
+            } catch (error) {
+                // Display an informative error message.
+                status.textContent = error.message;
+                status.className = "error";
+
+            } finally {
+                // Re-enable the button after processing.
+                button.disabled = false;
+            }
+        });
+    </script>
+
+</body>
+</html>
