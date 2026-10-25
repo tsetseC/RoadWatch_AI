@@ -7,4 +7,6 @@ ultralytics
 opencv-python-headless
 numpy
 pillow
+pandas
+ffmpeg
 
