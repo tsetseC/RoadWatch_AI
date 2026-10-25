@@ -265,7 +265,26 @@
                 });
 
                 // Read the JSON response from Flask.
+                
+                /*
+                 * RoadWatch AI - safe API response handling.
+                 * Avoid parsing an HTML error page as JSON.
+                 */
+                const contentType = response.headers.get("content-type") || "";
+                
+                if (!contentType.includes("application/json")) {
+                    throw new Error(
+                        `Server returned HTTP ${response.status} instead of JSON. ` +
+                        "Video processing may have timed out or the server may have restarted."
+                    );
+                }
+                
                 const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.error || "Video processing failed.");
+                }
+
 
                 // Handle backend processing errors.
                 if (!response.ok) {
